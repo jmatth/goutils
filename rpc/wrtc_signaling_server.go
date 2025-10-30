@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
 	"google.golang.org/grpc/codes"
@@ -18,6 +20,7 @@ import (
 
 	"go.viam.com/utils"
 	webrtcpb "go.viam.com/utils/proto/rpc/webrtc/v1"
+	"go.viam.com/utils/trace"
 )
 
 // A WebRTCSignalingServer implements a signaling service for WebRTC by exchanging
@@ -113,6 +116,8 @@ const maxHostsInMetadata = 5
 
 // HostsFromCtx gets the hosts being called/answered for from the context.
 func HostsFromCtx(ctx context.Context) ([]string, error) {
+	ctx, span := trace.StartSpan(ctx, "HostsFromCtx")
+	defer span.End()
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok || len(md[RPCHostMetadataField]) == 0 {
 		return nil, fmt.Errorf("expected %s to be set in metadata", RPCHostMetadataField)
@@ -264,9 +269,13 @@ func (srv *WebRTCSignalingServer) CallUpdate(ctx context.Context, req *webrtcpb.
 	if err != nil {
 		return nil, err
 	}
+	_, vhSpan := trace.StartSpan(ctx, "validateHosts")
 	if err := srv.validateHosts(host); err != nil {
+		vhSpan.End()
 		return nil, err
 	}
+	vhSpan.End()
+
 	switch u := req.GetUpdate().(type) {
 	case *webrtcpb.CallUpdateRequest_Candidate:
 		cand := iceCandidateFromProto(u.Candidate)
@@ -333,6 +342,8 @@ func (srv *WebRTCSignalingServer) clearAdditionalICEServers(hosts []string) {
 // Note: See SinalingAnswer.answer for the complementary side of this process.
 func (srv *WebRTCSignalingServer) Answer(server webrtcpb.SignalingService_AnswerServer) error {
 	ctx := server.Context()
+	ctx, span := trace.StartSpan(ctx, "WebRTCSignalingServer.Answer")
+	defer span.End()
 	hosts, err := HostsFromCtx(ctx)
 	if err != nil {
 		return err
@@ -356,7 +367,8 @@ func (srv *WebRTCSignalingServer) Answer(server webrtcpb.SignalingService_Answer
 		utils.PanicCapturingGo(func() {
 			for {
 				select {
-				case <-time.After(srv.heartbeatInterval):
+				case now := <-time.After(srv.heartbeatInterval):
+					span.AddEvent("sendAnswserHeartbeat", oteltrace.WithTimestamp(now))
 					if err := server.Send(&webrtcpb.AnswerRequest{
 						Stage: &webrtcpb.AnswerRequest_Heartbeat{},
 					}); err != nil {

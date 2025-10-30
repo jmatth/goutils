@@ -16,9 +16,11 @@ import (
 	"sync"
 	"time"
 
+	// "go.opencensus.io/metric/metricdata"
+	// "go.opencensus.io/metric/metricexport"
 	"go.opencensus.io/metric/metricdata"
-	"go.opencensus.io/metric/metricexport"
-	"go.opencensus.io/trace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.viam.com/utils/trace"
 
 	"go.viam.com/utils"
 )
@@ -27,8 +29,8 @@ import (
 type developmentExporter struct {
 	mu             sync.Mutex
 	children       map[string][]mySpanInfo
-	reader         *metricexport.Reader
-	ir             *metricexport.IntervalReader
+	// reader         *metricexport.Reader
+	// ir             *metricexport.IntervalReader
 	initReaderOnce sync.Once
 	o              DevelopmentExporterOptions
 
@@ -38,6 +40,12 @@ type developmentExporter struct {
 
 	// For testing. By default will be set to stdout.
 	outputWriter io.Writer
+}
+
+// Shutdown implements trace.SpanExporter.
+func (e *developmentExporter) Shutdown(ctx context.Context) error {
+	// TODO: need to check for + flush any spans?
+	return nil
 }
 
 // DevelopmentExporterOptions provides options for DevelopmentExporter.
@@ -56,7 +64,7 @@ type DevelopmentExporterOptions struct {
 type mySpanInfo struct {
 	toPrint string
 	id      string
-	Data    *trace.SpanData
+	Data    trace.ReadOnlySpan
 }
 
 var reZero = regexp.MustCompile(`^0+$`)
@@ -72,7 +80,7 @@ func NewDevelopmentExporter() Exporter {
 func NewDevelopmentExporterWithOptions(options DevelopmentExporterOptions) Exporter {
 	return &developmentExporter{
 		children:     map[string][]mySpanInfo{},
-		reader:       metricexport.NewReader(),
+		// reader:       metricexport.NewReader(),
 		o:            options,
 		outputWriter: os.Stdout,
 	}
@@ -85,28 +93,28 @@ func (e *developmentExporter) Start() error {
 	}
 
 	if !e.o.TracesDisabled {
-		trace.RegisterExporter(e)
-		trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
+		trace.SetTracerWithExporter(e, resource.Empty())
+		// trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
 	}
-	if !e.o.MetricsDisabled {
-		e.initReaderOnce.Do(func() {
-			var err error
-			e.ir, err = metricexport.NewIntervalReader(&metricexport.Reader{}, e)
-			utils.UncheckedError(err)
-		})
-		e.ir.ReportingInterval = e.o.ReportingInterval
-		return e.ir.Start()
-	}
+	// if !e.o.MetricsDisabled {
+	// 	e.initReaderOnce.Do(func() {
+	// 		var err error
+	// 		e.ir, err = metricexport.NewIntervalReader(&metricexport.Reader{}, e)
+	// 		utils.UncheckedError(err)
+	// 	})
+	// 	e.ir.ReportingInterval = e.o.ReportingInterval
+	// 	return e.ir.Start()
+	// }
 	return nil
 }
 
 // Stop stops the metric and span data exporter.
 func (e *developmentExporter) Stop() {
 	if !e.o.TracesDisabled {
-		trace.UnregisterExporter(e)
+		trace.Shutdown(context.Background())
 	}
 	if !e.o.MetricsDisabled {
-		e.ir.Stop()
+		// e.ir.Stop()
 	}
 }
 
@@ -259,9 +267,9 @@ func (wd *walkData) output(writer io.Writer) {
 
 func (e *developmentExporter) recurse(currSpan *mySpanInfo, callerPath []string, wd *walkData) {
 	// Get the accumulator for this
-	myPath := wd.get(callerPath, currSpan.Data.Name)
+	myPath := wd.get(callerPath, currSpan.Data.Name())
 	myPath.count++
-	myPath.timeNanos += currSpan.Data.EndTime.UnixNano() - currSpan.Data.StartTime.UnixNano()
+	myPath.timeNanos += currSpan.Data.EndTime().UnixNano() - currSpan.Data.StartTime().UnixNano()
 
 	// We incremented our counters. Now walk all of our children spans and do the same.
 	children := e.children[currSpan.id]
@@ -269,34 +277,37 @@ func (e *developmentExporter) recurse(currSpan *mySpanInfo, callerPath []string,
 		e.recurse(&children[idx], myPath.spanChain, wd)
 	}
 
-	if !e.deleteDisabled {
-		delete(e.children, currSpan.id)
-	}
+	// if !e.deleteDisabled {
+	// 	delete(e.children, currSpan.id)
+	// }
 }
 
-// ExportSpan exports a SpanData to log.
-func (e *developmentExporter) ExportSpan(sd *trace.SpanData) {
+// ExportSpans export SpanData to log.
+func (e *developmentExporter) ExportSpans(ctx context.Context, spans []trace.ReadOnlySpan) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	length := (sd.EndTime.UnixNano() - sd.StartTime.UnixNano()) / (1000 * 1000)
-	myinfo := fmt.Sprintf("%s %d ms", sd.Name, length)
+	for _, sd := range spans {
+		length := (sd.EndTime().UnixNano() - sd.StartTime().UnixNano()) / (1000 * 1000)
+		myinfo := fmt.Sprintf("%s %d ms", sd.Name, length)
 
-	if sd.Annotations != nil {
-		for _, a := range sd.Annotations {
-			myinfo = myinfo + " " + a.Message
+		for _, a := range sd.Attributes() {
+			myinfo = myinfo + " " + string(a.Key) + ":" + a.Value.Emit()
 		}
+
+		spanId := sd.SpanContext().SpanID()
+		spanID := hex.EncodeToString(spanId[:])
+		parentSpanId := sd.Parent().SpanID()
+		parentSpanID := hex.EncodeToString(parentSpanId[:])
+
+		if !reZero.MatchString(parentSpanID) {
+			e.children[parentSpanID] = append(e.children[parentSpanID], mySpanInfo{myinfo, spanID, sd})
+			continue
+		}
+
+		wd := walkData{}
+		e.recurse(&mySpanInfo{myinfo, spanID, sd}, []string{}, &wd)
+		wd.output(e.outputWriter)
 	}
-
-	spanID := hex.EncodeToString(sd.SpanID[:])
-	parentSpanID := hex.EncodeToString(sd.ParentSpanID[:])
-
-	if !reZero.MatchString(parentSpanID) {
-		e.children[parentSpanID] = append(e.children[parentSpanID], mySpanInfo{myinfo, spanID, sd})
-		return
-	}
-
-	wd := walkData{}
-	e.recurse(&mySpanInfo{myinfo, spanID, sd}, []string{}, &wd)
-	wd.output(e.outputWriter)
+	return nil
 }
