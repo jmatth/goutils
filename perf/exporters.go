@@ -136,6 +136,13 @@ type sdExporter struct {
 
 // Starts the applications stats/span monitoring. Registers views and starts trace/metric exporters to opencensus.
 func (e *sdExporter) Start() error {
+	traceOpts, err := env.ParseAs[struct{
+		TraceProbability float64 `env:"OC_TRACE_PROBABILITY"`
+	}]()
+	if err != nil {
+		return err
+	}
+
 	if err := registerApplicationViews(); err != nil {
 		return err
 	}
@@ -143,8 +150,13 @@ func (e *sdExporter) Start() error {
 	if err := e.sdExporter.StartMetricsExporter(); err != nil {
 		return err
 	}
+
 	trace.RegisterExporter(e.sdExporter)
-	trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
+	traceCfg := trace.Config{DefaultSampler: trace.AlwaysSample()}
+	if traceOpts.TraceProbability != 0 {
+		traceCfg.DefaultSampler = trace.ProbabilitySampler(traceOpts.TraceProbability)
+	}
+	trace.ApplyConfig(traceCfg)
 	return nil
 }
 
